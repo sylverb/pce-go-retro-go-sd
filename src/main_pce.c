@@ -132,9 +132,9 @@ static const struct
 	SVAR_A("vce_regs", PCE.VCE.regs),           SVAR_2("vce_reg", PCE.VCE.reg),
 
 	// VDC
-	SVAR_A("vdc_regs", PCE.VDC.regs),           SVAR_1("vdc_reg", PCE.VDC.reg),
-	SVAR_1("vdc_status", PCE.VDC.status),       SVAR_1("vdc_vram", PCE.VDC.vram),
-	SVAR_1("vdc_satb", PCE.VDC.satb),			SVAR_4("vdc_pen_irqs", PCE.VDC.pending_irqs),
+	SVAR_A("vdc_regs", PCE.vdc[0].regs),       SVAR_1("vdc_reg", PCE.vdc[0].reg),
+	SVAR_1("vdc_status", PCE.vdc[0].status),   SVAR_1("vdc_vram", PCE.vdc[0].vram),
+	SVAR_1("vdc_satb", PCE.vdc[0].satb),      SVAR_4("vdc_pen_irqs", PCE.vdc[0].pending_irqs),
 
 	// Timer
 	SVAR_1("timer_reload", PCE.Timer.reload),   SVAR_1("timer_running", PCE.Timer.running),
@@ -330,6 +330,9 @@ static bool SaveState(const char *savePathName) {
         fwrite(&scsx, sizeof(scsx), 1, file);
         fwrite(&sst, sizeof(sst), 1, file);
     }
+    /* SuperGrafx trailer: VRAM2 + work RAM + VDC2/VPC (after CD blocks so the
+     * 76 KiB core offset for PCE-CD stays valid). */
+    pce_sgx_state_write(file);
     fclose(file);
     if (!written) {
         return false;
@@ -404,13 +407,21 @@ static bool LoadState(const char *savePathName) {
             pce_scsi_state_set(&sst);
         }
         pce_scsi_post_restore();
+        /* SGX trailer follows CD blocks when present. */
+        pce_sgx_state_read(file);
+    } else if (PCE.IsSGX) {
+        /* HuCard SGX: trailer sits right after the fixed 76 KiB core pad. */
+        fseek(file, SAVE_STATE_BUFFER_SIZE, SEEK_SET);
+        pce_sgx_state_read(file);
     }
     fclose(file);
 
     for(int i = 0; i < 8; i++) {
         pce_bank_set(i, PCE.MMR[i]);
     }
+    pce_vdc_bind();
     gfx_reset(true);
+    gfx_palette_reload();
     osd_gfx_set_mode(IO_VDC_SCREEN_WIDTH, IO_VDC_SCREEN_HEIGHT);
     pce_fb_clear();   /* drop pixels from the pre-load screen / old FB offset */
     common_emu_state.skip_frames = 0;
@@ -522,6 +533,41 @@ static void pce_rom_patch()
     }
 }
 
+/* Early SuperGrafx detect (ext / path) — before ROM is mapped. */
+static int pce_ext_is_sgx(const char *ext)
+{
+    if (!ext || !ext[0])
+        return 0;
+    if ((ext[0] == 's' || ext[0] == 'S') &&
+        (ext[1] == 'g' || ext[1] == 'G') &&
+        (ext[2] == 'x' || ext[2] == 'X') &&
+        ext[3] == '\0')
+        return 1;
+    return 0;
+}
+
+static int pce_path_under_sgx(const char *path)
+{
+    if (!path)
+        return 0;
+    for (const char *p = path; *p; p++) {
+        if ((p[0] == '/' || p[0] == '\\') &&
+            (p[1] == 's' || p[1] == 'S') &&
+            (p[2] == 'g' || p[2] == 'G') &&
+            (p[3] == 'x' || p[3] == 'X') &&
+            (p[4] == '/' || p[4] == '\\' || p[4] == '\0'))
+            return 1;
+    }
+    return 0;
+}
+
+static int pce_rom_is_sgx_early(void)
+{
+    if (!ACTIVE_FILE)
+        return 0;
+    return pce_ext_is_sgx(ACTIVE_FILE->ext) || pce_path_under_sgx(ACTIVE_FILE->path);
+}
+
 size_t
 pce_osd_getromdata(unsigned char **data)
 {
@@ -568,7 +614,9 @@ pce_osd_getromdata(unsigned char **data)
         return (*data != NULL && bios_size > 0) ? bios_size : 0;
     }
     uint32_t size = ACTIVE_FILE->size;
-    if (size > ram_get_free_size()) {
+    /* SuperGrafx needs ~90 KiB RAM_EMU (VRAM2 + work RAM). Always XIP the
+     * cart from flash cache — never ram_malloc the ROM. */
+    if (pce_rom_is_sgx_early() || size > ram_get_free_size()) {
         *data = odroid_overlay_cache_file_in_flash(ACTIVE_FILE->path, &size, false);
     } else {
         *data = ram_malloc(size);
@@ -577,6 +625,54 @@ pce_osd_getromdata(unsigned char **data)
         }
     }
     return size;
+}
+
+/* Mednafen pce_fast sgx_table — identify SuperGrafx dumps shipped as .pce */
+static const uint32_t pce_sgx_crcs[] = {
+    0xbebfe042u, /* Darius Plus */
+    0x4c2126b0u, /* Aldynes */
+    0x8c4588e2u, /* 1941 - Counter Attack */
+    0x1f041166u, /* Madouou Granzort */
+    0xb486a8edu, /* Daimakaimura */
+    0x3b13af61u, /* Battle Ace */
+    0
+};
+
+static int pce_cart_is_sgx(void)
+{
+    int want = 0;
+
+    if (pce_rom_is_sgx_early())
+        want = 1;
+    else if (PCE.ROM_DATA && PCE.ROM_SIZE) {
+        /* Header-stripped CRC (Mednafen HuC_Load) */
+        uint32_t crc = crc32_le(0, PCE.ROM_DATA, (unsigned)PCE.ROM_SIZE * 0x2000u);
+        for (int i = 0; pce_sgx_crcs[i]; i++) {
+            if (pce_sgx_crcs[i] == crc) {
+                want = 1;
+                break;
+            }
+        }
+        /* Some dumps / our ROM_CRC path include a 512 B header */
+        if (!want) {
+            for (int i = 0; pce_sgx_crcs[i]; i++) {
+                if (pce_sgx_crcs[i] == PCE.ROM_CRC) {
+                    want = 1;
+                    break;
+                }
+            }
+        }
+    }
+
+    /* Space Harrier is not SGX-compatible (Mednafen) */
+    if (PCE.ROM_DATA && PCE.ROM_SIZE) {
+        uint32_t crc = crc32_le(0, PCE.ROM_DATA, (unsigned)PCE.ROM_SIZE * 0x2000u);
+        if (crc == 0x64580427u || crc == 0x43b05eb8u ||
+            PCE.ROM_CRC == 0x64580427u || PCE.ROM_CRC == 0x43b05eb8u)
+            want = 0;
+    }
+
+    return want;
 }
 
 void LoadCartPCE() {
@@ -686,6 +782,10 @@ void LoadCartPCE() {
         pce_rom_patch();
     else
         pce_rom_full_patch();
+
+    /* SuperGrafx: .sgx, /roms/sgx/ (.pce OK), or Mednafen CRC table */
+    if (pce_cart_is_sgx())
+        pce_sgx_enable();
 
     /* PCE-CD: back the CD-ROM2 program-RAM banks with real RAM. The System Card
      * is XIP'd from flash (pce_osd_getromdata), so the RAM_EMU bump is free to
@@ -831,9 +931,17 @@ static void blit() {
                 framebuffer_active[offsetY+x]= mypalette[fbTmp[ (x * xScale) >> 8 ]];
             }
         } else {
-            for(int x=0;x<renderWidth;x++) {
-                   framebuffer_active[offsetY+x+offsetX]=mypalette[fbTmp[x+cropX]];
+            const int dst0 = offsetY + offsetX;
+            const int src0 = cropX;
+            int x = 0;
+            for (; x + 4 <= renderWidth; x += 4) {
+                framebuffer_active[dst0 + x]     = mypalette[fbTmp[src0 + x]];
+                framebuffer_active[dst0 + x + 1] = mypalette[fbTmp[src0 + x + 1]];
+                framebuffer_active[dst0 + x + 2] = mypalette[fbTmp[src0 + x + 2]];
+                framebuffer_active[dst0 + x + 3] = mypalette[fbTmp[src0 + x + 3]];
             }
+            for (; x < renderWidth; x++)
+                framebuffer_active[dst0 + x] = mypalette[fbTmp[src0 + x]];
         }
     }
     if (!vdc_res_changed) {

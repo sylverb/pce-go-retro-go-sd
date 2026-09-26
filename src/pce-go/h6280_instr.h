@@ -1981,7 +1981,12 @@ OPCODE_FUNC smb(UBYTE bit)
 OPCODE_FUNC st0(void)
 {
 	CPU_PCE.P &= ~FL_T;
-	pce_writeIO(0, imm_operand(CPU_PCE.PC + 1));
+	{
+		uint16_t a = 0;
+		if (PCE.IsSGX && PCE.vpc.st_mode)
+			a |= 0x10;
+		pce_writeIO(a, imm_operand(CPU_PCE.PC + 1));
+	}
 	CPU_PCE.PC += 2;
 	Cycles += 4;
 }
@@ -1989,7 +1994,12 @@ OPCODE_FUNC st0(void)
 OPCODE_FUNC st1(void)
 {
 	CPU_PCE.P &= ~FL_T;
-	pce_writeIO(2, imm_operand(CPU_PCE.PC + 1));
+	{
+		uint16_t a = 2;
+		if (PCE.IsSGX && PCE.vpc.st_mode)
+			a |= 0x10;
+		pce_writeIO(a, imm_operand(CPU_PCE.PC + 1));
+	}
 	CPU_PCE.PC += 2;
 	Cycles += 4;
 }
@@ -1997,7 +2007,12 @@ OPCODE_FUNC st1(void)
 OPCODE_FUNC st2(void)
 {
 	CPU_PCE.P &= ~FL_T;
-	pce_writeIO(3, imm_operand(CPU_PCE.PC + 1));
+	{
+		uint16_t a = 3;
+		if (PCE.IsSGX && PCE.vpc.st_mode)
+			a |= 0x10;
+		pce_writeIO(a, imm_operand(CPU_PCE.PC + 1));
+	}
 	CPU_PCE.PC += 2;
 	Cycles += 4;
 }

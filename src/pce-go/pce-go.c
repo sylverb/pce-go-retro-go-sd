@@ -58,9 +58,9 @@ static const struct
 	SVAR_A("vce_regs", PCE.VCE.regs),           SVAR_2("vce_reg", PCE.VCE.reg),
 
 	// VDC
-	SVAR_A("vdc_regs", PCE.VDC.regs),           SVAR_1("vdc_reg", PCE.VDC.reg),
-	SVAR_1("vdc_status", PCE.VDC.status),       SVAR_1("vdc_satb", PCE.VDC.vram),
-	SVAR_1("vdc_satb", PCE.VDC.satb),			SVAR_4("vdc_pen_irqs", PCE.VDC.pending_irqs),
+	SVAR_A("vdc_regs", PCE.vdc[0].regs),           SVAR_1("vdc_reg", PCE.vdc[0].reg),
+	SVAR_1("vdc_status", PCE.vdc[0].status),       SVAR_1("vdc_satb", PCE.vdc[0].vram),
+	SVAR_1("vdc_satb", PCE.vdc[0].satb),			SVAR_4("vdc_pen_irqs", PCE.vdc[0].pending_irqs),
 
 	// Timer
 	SVAR_1("timer_reload", PCE.Timer.reload),   SVAR_1("timer_running", PCE.Timer.running),
@@ -339,7 +339,10 @@ LoadState(const char *name)
 		pce_bank_set(i, PCE.MMR[i]);
 	}
 
+	pce_sgx_state_read(fp);
+	pce_vdc_bind();
 	gfx_reset(true);
+	gfx_palette_reload();
 
 	osd_gfx_set_mode(IO_VDC_SCREEN_WIDTH, IO_VDC_SCREEN_HEIGHT);
 
@@ -368,6 +371,8 @@ SaveState(const char *name)
 		MESSAGE_INFO("Saving %s (%d)\n", SaveStateVars[i].key, SaveStateVars[i].len);
 		fwrite(SaveStateVars[i].ptr, SaveStateVars[i].len, 1, fp);
 	}
+
+	pce_sgx_state_write(fp);
 
 	fclose(fp);
 

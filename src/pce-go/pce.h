@@ -1,6 +1,7 @@
 #pragma once
 
 #include "pce-go.h"
+#include <stdio.h>
 
 #define EXPECT_UNLIKELY(n) __builtin_expect((n) != 0, 0)
 #define EXPECT_LIKELY(n) __builtin_expect((n) != 0, 1)
@@ -92,18 +93,46 @@ typedef struct {
 	int32_t noise_rand;
 } psg_chan_t;
 
+/* One HuC6270 Video Display Controller */
 typedef struct {
-	// Main memory
+	UWord regs[32];			/* value of each VDC register */
+	uint8_t reg;			/* currently selected VDC register */
+	uint8_t status;			/* current VDC status */
+	uint8_t vram;			/* VRAM DMA transfer status */
+	uint8_t satb;			/* SATB DMA transfer status */
+	uint8_t mode_chg;		/* Video mode change needed at next frame */
+	uint32_t pending_irqs;		/* Pending VDC IRQs (stack of 4bit events) */
+	uint16_t *vram_mem;		/* VRAM backing (32K words) */
+	uint16_t *spram;		/* Sprite attribute table RAM (256 words) */
+	int scroll_y_diff;		/* BYR mid-frame offset (per VDC) */
+} vdc_t;
+
+/* HuC6202 Video Priority Controller (SuperGrafx) */
+typedef struct {
+	uint8_t priority[2];
+	uint16_t winwidths[2];
+	uint8_t st_mode;
+} vpc_t;
+
+typedef struct {
+	// Main memory (bank $F8). SuperGrafx maps $F8–$FB as 32 KiB via RAM_SGX.
 	uint8_t RAM[0x2000];
 
-	// Video RAM
+	// Video RAM (VDC1). VDC2 uses VRAM2 when IsSGX.
 	uint16_t VRAM[0x8000];
 
-	// Sprite RAM
+	// Sprite RAM (VDC1 / VDC2)
 	uint16_t SPRAM[0x100];
+	uint16_t SPRAM2[0x100];
 
 	// Extra RAM contained on the HuCard (Populous)
 	uint8_t *ExRAM;
+
+	/* SuperGrafx: VRAM2 (64 KiB) and banks $F9–$FB (24 KiB) via ram_malloc */
+	uint16_t *VRAM2;
+	uint8_t *RAM_SGX;
+	bool IsSGX;
+	vpc_t vpc;
 
 	// ROM memory
 	uint8_t *ROM, *ROM_DATA;
@@ -131,7 +160,7 @@ typedef struct {
 	// The current rendered line on screen
 	uint32_t Scanline;
 
-	//
+	/* Legacy alias: VDC0 scroll mid-frame offset (kept for PCE path macros). */
 	int ScrollYDiff;
 
 	// Number of executed CPU_PCE cycles
@@ -182,16 +211,8 @@ typedef struct {
 		UWord reg;				/* currently selected color */
 	} VCE;
 
-	// Video Display Controller
-	struct {
-		UWord regs[32];			/* value of each VDC register */
-		uint8_t reg;			/* currently selected VDC register */
-		uint8_t status;			/* current VCD status (end of line, end of screen, ...) */
-		uint8_t vram;			/* VRAM DMA transfer status to happen in vblank */
-		uint8_t satb;			/* DMA transfer status to happen in vblank */
-		uint8_t mode_chg;       /* Video mode change needed at next frame */
-		uint32_t pending_irqs;	/* Pending VDC IRQs (we use it as a stack of 4bit events) */
-	} VDC;
+	/* VDC1 at [0], VDC2 at [1] (SuperGrafx). PCE uses only [0]. */
+	vdc_t vdc[2];
 
 	// Programmable Sound Generator
 	struct {
@@ -218,10 +239,11 @@ extern uint8_t *PageW[8];
 
 #define Cycles PCE.Cycles
 
-#define IO_VDC_REG           PCE.VDC.regs
-#define IO_VDC_REG_ACTIVE    PCE.VDC.regs[PCE.VDC.reg]
-#define IO_VDC_REG_INC(reg)  {uint8_t _i[] = {1,32,64,128}; PCE.VDC.regs[(reg)].W += _i[(PCE.VDC.regs[CR].W >> 11) & 3];}
-#define IO_VDC_STATUS(bit)   ((PCE.VDC.status >> bit) & 1)
+/* Macros target VDC1 (chip 0). Use PCE.vdc[n] for SuperGrafx chip 1. */
+#define IO_VDC_REG           PCE.vdc[0].regs
+#define IO_VDC_REG_ACTIVE    PCE.vdc[0].regs[PCE.vdc[0].reg]
+#define IO_VDC_REG_INC(reg)  {uint8_t _i[] = {1,32,64,128}; PCE.vdc[0].regs[(reg)].W += _i[(PCE.vdc[0].regs[CR].W >> 11) & 3];}
+#define IO_VDC_STATUS(bit)   ((PCE.vdc[0].status >> bit) & 1)
 #define IO_VDC_MINLINE       (IO_VDC_REG[VPR].B.h + IO_VDC_REG[VPR].B.l)
 #define IO_VDC_MAXLINE       (IO_VDC_MINLINE + IO_VDC_REG[VDW].W)
 #define IO_VDC_SCREEN_WIDTH  ((IO_VDC_REG[HDR].B.l + 1) * 8)
@@ -230,6 +252,13 @@ extern uint8_t *PageW[8];
 #define M_vdc_HDS (IO_VDC_REG[HSR].B.h & 0x7F) // Horizontal Display Start
 #define M_vdc_HDW (IO_VDC_REG[HDR].B.l & 0x7F) // Horizontal Display Width
 #define M_vdc_HDE (IO_VDC_REG[HDR].B.h & 0x7F) // Horizontal Display End
+
+#define VDC_REG(v, r)        ((v)->regs[(r)])
+#define VDC_MINLINE(v)       (VDC_REG(v, VPR).B.h + VDC_REG(v, VPR).B.l)
+#define VDC_MAXLINE(v)       (VDC_MINLINE(v) + VDC_REG(v, VDW).W)
+#define VDC_SCREEN_WIDTH(v)  ((VDC_REG(v, HDR).B.l + 1) * 8)
+#define VDC_SCREEN_HEIGHT(v) (VDC_REG(v, VDW).W + 1)
+#define VDC_REG_INC(v, reg)  {uint8_t _i[] = {1,32,64,128}; (v)->regs[(reg)].W += _i[((v)->regs[CR].W >> 11) & 3];}
 
 
 
@@ -262,6 +291,10 @@ void pce_run(void);
 void pce_pause(void);
 void pce_writeIO(uint16_t A, uint8_t V);
 uint8_t pce_readIO(uint16_t A);
+void pce_sgx_enable(void);
+void pce_vdc_bind(void);
+void pce_sgx_state_write(FILE *file);
+bool pce_sgx_state_read(FILE *file);
 
 #ifdef PCE_ENABLE_ARCADE_CARD
 extern uint8_t PCE_ACAREA_MARKER[1];

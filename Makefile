@@ -56,6 +56,7 @@ PACKED_BIN   := $(CORE_NAME).bin
 PAD_LOGO     := src/assets/pad.bmp
 HEADER_LOGO  := src/assets/header.bmp
 HEADER_CD    := src/assets/header_cd.bmp
+HEADER_SGX   := src/assets/header_sgx.png
 
 else
 $(error PROJECT_KIND must be 'core' (got '$(PROJECT_KIND)'))
@@ -74,11 +75,12 @@ CORE_VERSION ?= $(shell git describe --tags --dirty 2>/dev/null || echo NOTAG)
 #######################################
 .PHONY: pack
 
-pack: $(TARGET_BIN) $(BUILD_DIR)/pce_core_itcm.bin $(PAD_LOGO) $(HEADER_LOGO) $(HEADER_CD)
+pack: $(TARGET_BIN) $(BUILD_DIR)/pce_core_itcm.bin $(PAD_LOGO) $(HEADER_LOGO) $(HEADER_CD) $(HEADER_SGX)
 	$(V)$(ECHO) [ PACK CORE ] $(PACKED_BIN) version=$(CORE_VERSION)
 	$(V)python3 $(PACK_CORE) \
 		--elf $(TARGET_ELF) --bin $(TARGET_BIN) \
 		--system name="PC Engine",dirname=pce,pad_logo=$(PAD_LOGO),header_logo=$(HEADER_LOGO),ext=pce,parse=rom,cheat_ext=pceplus \
+		--system name="SuperGrafx",dirname=sgx,pad_logo=$(PAD_LOGO),header_logo=$(HEADER_SGX),ext="sgx pce",parse=rom,cheat_ext=pceplus \
 		--system name="PC Engine CD",dirname=pcecd,pad_logo=$(PAD_LOGO),header_logo=$(HEADER_CD),ext=cue,parse=cdrom,cheat_ext=pceplus \
 		--logo-invert \
 		--segment itcm:__ITCM_CORE_START__:__CORE_ITCM_CODE_END__:__CORE_ITCM_BSS_END__:$(BUILD_DIR)/pce_core_itcm.bin \
