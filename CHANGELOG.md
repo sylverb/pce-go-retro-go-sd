@@ -1,8 +1,6 @@
 # Changelog
 
-## [v0.0.1]
-
-Initial core release
+## [v0.0.2]
 
 ### Added
 
@@ -14,7 +12,7 @@ Initial core release
 
 ### Fixed
 
-- Fix voice saturation issue which sometimes occurs in YS III
+- Nothing
 
 ### Install
 
