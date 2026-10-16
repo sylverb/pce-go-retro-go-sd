@@ -17,6 +17,7 @@
 #include "common.h"
 #include "sound_pce.h"
 #include "pce_cd.h"
+#include "pce_cd_ogg.h"
 #include "pce_scsi.h"
 #include "pce_adpcm.h"
 #include "appid.h"
@@ -607,10 +608,13 @@ pce_osd_getromdata(unsigned char **data)
         }
         /* Mount the disc so the System Card's SCSI reads ($1800) hit the CUE/BIN. */
         pce_cd_close();   /* drop any stale cached .bin handle from a prior launch */
-        if (pce_cd_parse_cue(ACTIVE_FILE->path, &s_pcecd_toc))
+        if (pce_cd_parse_cue(ACTIVE_FILE->path, &s_pcecd_toc)) {
+            /* Reserve OGG decode arena BEFORE CD-RAM mapping (below) eats the bump. */
+            pce_cd_ogg_prepare(&s_pcecd_toc);
             pce_scsi_set_disc(&s_pcecd_toc, true);
-        else
+        } else {
             pce_scsi_set_disc(NULL, false);
+        }
         return (*data != NULL && bios_size > 0) ? bios_size : 0;
     }
     uint32_t size = ACTIVE_FILE->size;

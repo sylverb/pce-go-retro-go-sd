@@ -12,6 +12,8 @@
 #include <string.h>
 
 #define ADPCM_RAM_SIZE  0x10000
+
+#include "gw_malloc.h"
 #define OUT_RATE        44100   /* = PCE_SAMPLE_RATE */
 #define ADPCM_READ_DELAY  (19 * 3)   /* $180A read pending, CPU cycles */
 #define ADPCM_WRITE_DELAY (3 * 11)   /* $180A write pending */
@@ -23,7 +25,8 @@ static const int StepSizes[49] = {
 };
 static const int StepIdxDelta[16] = { -1,-1,-1,-1,2,4,6,8, -1,-1,-1,-1,2,4,6,8 };
 
-static uint8_t  s_ram[ADPCM_RAM_SIZE];
+/* 64 KiB sample RAM — DTCM preferred (frees RAM_EMU for OGG decode arena). */
+static uint8_t *s_ram;
 static uint16_t s_addr, s_read_addr, s_write_addr, s_length;
 static uint8_t  s_read_buffer;
 static uint8_t  s_play_buffer;
@@ -139,8 +142,22 @@ void pce_adpcm_frame_end(void)
     s_adpcm_last_sync = 0;
 }
 
+static void adpcm_ram_ensure(void)
+{
+    if (s_ram)
+        return;
+    s_ram = (uint8_t *)dtc_calloc(ADPCM_RAM_SIZE, 1);
+    if (!s_ram)
+        s_ram = (uint8_t *)ram_calloc(ADPCM_RAM_SIZE, 1);
+    if (!s_ram)
+        s_ram = (uint8_t *)ahb_calloc(ADPCM_RAM_SIZE, 1);
+}
+
 void pce_adpcm_reset(void)
 {
+    adpcm_ram_ensure();
+    if (s_ram)
+        memset(s_ram, 0, ADPCM_RAM_SIZE);
     s_addr = s_read_addr = s_write_addr = s_length = 0;
     s_read_buffer = s_play_buffer = s_write_pending_val = 0;
     s_last_cmd = s_freq = 0;
@@ -226,6 +243,8 @@ uint8_t pce_adpcm_read(uint8_t reg)
 
 void pce_adpcm_dma_byte(uint8_t val)
 {
+    adpcm_ram_ensure();
+    if (!s_ram) return;
     s_ram[s_write_addr++] = val;
     if (!(s_last_cmd & 0x10)) {
         s_half = (s_length < 32768);
@@ -296,7 +315,11 @@ void pce_adpcm_set(const uint32_t in[PCE_ADPCM_STATE_WORDS])
     s_adpcm_last_sync = Cycles;
 }
 
-uint8_t *pce_adpcm_ram(void) { return s_ram; }
+uint8_t *pce_adpcm_ram(void)
+{
+    adpcm_ram_ensure();
+    return s_ram;
+}
 
 int pce_adpcm_fill(int16_t *out, int frames)
 {

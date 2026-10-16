@@ -1,9 +1,39 @@
-/* PC Engine CD — CUE/BIN disc layer. See pce_cd.h. */
+/* PC Engine CD — CUE/BIN(/OGG) disc layer. See pce_cd.h. */
 #include "pce_cd.h"
+#include "pce_cd_ogg.h"
 
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <ctype.h>
+
+#define PCE_CDDA_FRAMES_PER_SEC  588
+
+static int str_ieq(const char *a, const char *b)
+{
+    while (*a && *b) {
+        if (tolower((unsigned char)*a) != tolower((unsigned char)*b))
+            return 0;
+        a++; b++;
+    }
+    return *a == 0 && *b == 0;
+}
+
+static pce_cd_file_fmt_t detect_file_fmt(const char *type_tok, const char *name)
+{
+    if (type_tok && *type_tok) {
+        if (str_ieq(type_tok, "OGG") || str_ieq(type_tok, "VORBIS"))
+            return PCE_FILE_OGG;
+        if (str_ieq(type_tok, "BINARY") || str_ieq(type_tok, "MOTOROLA") ||
+            str_ieq(type_tok, "WAVE") || str_ieq(type_tok, "AIFF"))
+            return PCE_FILE_BINARY;
+    }
+    /* Sniff extension when the cue omits the type keyword. */
+    const char *dot = strrchr(name, '.');
+    if (dot && str_ieq(dot, ".ogg"))
+        return PCE_FILE_OGG;
+    return PCE_FILE_BINARY;
+}
 
 /* Resolve a .cue FILE reference (relative) against the cue's own directory. */
 static void resolve_bin_path(const char *cue_path, const char *name, char *out, size_t out_size)
@@ -47,7 +77,9 @@ bool pce_cd_parse_cue(const char *cue_path, pce_cd_toc_t *toc)
     memset(toc, 0, sizeof(*toc));
 
     char     cur_bin[256] = {0};
-    uint32_t cur_file_base_lba = 0;   /* absolute LBA at offset 0 of cur_bin */
+    pce_cd_file_fmt_t cur_fmt = PCE_FILE_BINARY;
+    uint32_t cur_file_base_lba = 0;   /* absolute LBA at offset 0 of cur file */
+    uint32_t cur_file_pcm = 0;       /* OGG: total PCM frames in cur file */
     uint32_t running_lba = 0;         /* total sectors across files seen so far */
     int      ti = -1;                 /* current track index */
     char     line[512];
@@ -65,11 +97,28 @@ bool pce_cd_parse_cue(const char *cue_path, pce_cd_toc_t *toc)
             memcpy(name, q1 + 1, n);
             name[n] = '\0';
 
+            /* Type keyword after the closing quote (BINARY / OGG / WAVE / …). */
+            const char *type = q2 + 1;
+            while (*type == ' ' || *type == '\t') type++;
+            char type_tok[32] = {0};
+            sscanf(type, "%31s", type_tok);
+
             resolve_bin_path(cue_path, name, cur_bin, sizeof(cur_bin));
+            cur_fmt = detect_file_fmt(type_tok, name);
             cur_file_base_lba = running_lba;
-            long sz = file_size_bytes(cur_bin);
-            if (sz > 0)
-                running_lba += (uint32_t)(sz / PCE_CD_SECTOR_RAW);
+            cur_file_pcm = 0;
+
+            if (cur_fmt == PCE_FILE_OGG) {
+                uint32_t samples = 0;
+                if (pce_cd_ogg_probe_samples(cur_bin, &samples) && samples > 0) {
+                    cur_file_pcm = samples;
+                    running_lba += (samples + PCE_CDDA_FRAMES_PER_SEC - 1) / PCE_CDDA_FRAMES_PER_SEC;
+                }
+            } else {
+                long sz = file_size_bytes(cur_bin);
+                if (sz > 0)
+                    running_lba += (uint32_t)(sz / PCE_CD_SECTOR_RAW);
+            }
         }
         else if (strncmp(p, "TRACK", 5) == 0) {
             int num = 0;
@@ -80,7 +129,11 @@ bool pce_cd_parse_cue(const char *cue_path, pce_cd_toc_t *toc)
             pce_cd_track_t *t = &toc->tracks[ti];
             t->number = (uint8_t)num;
             t->type = (strncmp(mode, "AUDIO", 5) == 0) ? PCE_TRACK_AUDIO : PCE_TRACK_DATA;
+            t->file_fmt = cur_fmt;
             t->sector_size = (strstr(mode, "/2048")) ? 2048 : PCE_CD_SECTOR_RAW;
+            if (cur_fmt == PCE_FILE_OGG)
+                t->sector_size = PCE_CD_SECTOR_RAW;
+            t->pcm_samples = cur_file_pcm;
             strncpy(t->bin_path, cur_bin, sizeof(t->bin_path) - 1);
         }
         else if (strncmp(p, "INDEX", 5) == 0 && ti >= 0) {
@@ -90,7 +143,13 @@ bool pce_cd_parse_cue(const char *cue_path, pce_cd_toc_t *toc)
             uint32_t frames = (uint32_t)((mm * 60 + ss) * 75 + ff);
             pce_cd_track_t *t = &toc->tracks[ti];
             t->start_lba = cur_file_base_lba + frames;
-            t->file_offset = frames * t->sector_size;
+            if (t->file_fmt == PCE_FILE_OGG) {
+                t->sample_offset = frames * PCE_CDDA_FRAMES_PER_SEC;
+                t->file_offset = 0;
+            } else {
+                t->file_offset = frames * t->sector_size;
+                t->sample_offset = 0;
+            }
         }
     }
     fclose(cue);
@@ -141,6 +200,7 @@ void pce_cd_close(void)
         s_bin_path[i][0] = 0;
         s_bin_pos[i] = -1;
     }
+    pce_cd_ogg_close_stream();
 }
 
 /* After sdcard_deinit() + remount on sleep/wake the cached FILE* are
@@ -154,6 +214,7 @@ void pce_cd_invalidate_handles(void)
         s_bin_path[i][0] = 0;
         s_bin_pos[i] = -1;
     }
+    pce_cd_ogg_invalidate_handles();
 }
 
 /* Seek only when the cached position diverges (non-sequential jump). */
@@ -226,6 +287,9 @@ bool pce_cd_read_sector(const pce_cd_toc_t *toc, uint32_t lba, uint8_t *buf)
 /* CD-DA streaming path (slot 1) — its own handle so it never thrashes the data handle. */
 bool pce_cd_read_sector_audio(const pce_cd_toc_t *toc, uint32_t lba, uint8_t *buf)
 {
+    int ti = pce_cd_track_at_lba(toc, lba);
+    if (ti >= 0 && toc->tracks[ti].file_fmt == PCE_FILE_OGG)
+        return pce_cd_ogg_read_sectors(toc, lba, buf, 1) == 1;
     return read_sector_slot(1, toc, lba, buf);
 }
 
@@ -238,6 +302,8 @@ int pce_cd_read_sectors_audio(const pce_cd_toc_t *toc, uint32_t lba, uint8_t *bu
     int ti = pce_cd_track_at_lba(toc, lba);
     if (ti < 0 || max_n <= 0) return 0;
     const pce_cd_track_t *t = &toc->tracks[ti];
+    if (t->file_fmt == PCE_FILE_OGG)
+        return pce_cd_ogg_read_sectors(toc, lba, buf, max_n);
     if (t->sector_size != PCE_CD_SECTOR_RAW)      /* audio must be raw 2352B */
         return pce_cd_read_sector_audio(toc, lba, buf) ? 1 : 0;
 

@@ -22,13 +22,18 @@ src/pce-go/h6280.c \
 src/pce-go/pce.c \
 src/porting/sound_pce.c \
 src/porting/pce_cd.c \
+src/porting/pce_cd_ogg.c \
 src/porting/pce_scsi.c \
 src/porting/pce_adpcm.c \
 src/main_pce.c
 
 CORE_C_INCLUDES := \
 -Isrc/porting \
--Isrc/pce-go
+-Isrc/pce-go \
+-Isrc/porting/third_party/stb_vorbis
+
+# stb_vorbis needs sin/cos/log/exp/ldexp from libm (core links -nostdlib).
+CORE_LDLIBS := -lm
 
 GNW_CORE_SDK ?= sdk
 BUILD_DIR ?= build/$(PROJECT_KIND)

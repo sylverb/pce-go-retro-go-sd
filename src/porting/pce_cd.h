@@ -8,7 +8,9 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-#define PCE_CD_MAX_TRACKS   100
+/* 48 tracks covers real PCE-CD sets (Ys III has 25); keeps TOC BSS smaller so
+ * the OGG decode arena (~168 KiB) still leaves room for full 256 KiB CD-RAM. */
+#define PCE_CD_MAX_TRACKS   48
 #define PCE_CD_SECTOR_RAW   2352      /* bytes per raw sector (MODE1/2352, AUDIO) */
 #define PCE_CD_LEADIN_LBA   150       /* 2 s pre-gap: MSF 00:02:00 == LBA 0 */
 
@@ -28,14 +30,22 @@ typedef enum {
     PCE_TRACK_DATA  = 1,
 } pce_track_type_t;
 
+typedef enum {
+    PCE_FILE_BINARY = 0,  /* raw 2352/2048 sectors (default) */
+    PCE_FILE_OGG    = 1,  /* Vorbis; decoded to synthetic Red Book sectors */
+} pce_cd_file_fmt_t;
+
 typedef struct {
     uint8_t          number;       /* 1-based track number */
     pce_track_type_t type;
-    uint32_t         sector_size;  /* on-disc bytes per sector (2352 or 2048) */
+    pce_cd_file_fmt_t file_fmt;
+    uint32_t         sector_size;  /* on-disc bytes per sector (2352 or 2048); OGG uses 2352 */
     uint32_t         start_lba;    /* absolute disc LBA of INDEX 01 */
     uint32_t         length_lba;   /* sectors in this track */
-    char             bin_path[256];/* full path to the .bin holding this track */
-    uint32_t         file_offset;  /* byte offset of INDEX 01 within bin_path */
+    char             bin_path[256];/* full path to the .bin / .ogg holding this track */
+    uint32_t         file_offset;  /* BINARY: byte offset of INDEX 01 within file */
+    uint32_t         sample_offset;/* OGG: PCM frame offset of INDEX 01 within file */
+    uint32_t         pcm_samples;  /* OGG: total frames in the file (0 if unknown) */
 } pce_cd_track_t;
 
 typedef struct {

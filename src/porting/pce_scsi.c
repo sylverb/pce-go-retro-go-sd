@@ -183,7 +183,7 @@ static uint32_t s_cdda_lba, s_cdda_end, s_cdda_start; /* current/end/start secto
  * frames = a periodic hitch ("dragging" audio). A frame only consumes ~1.25
  * sectors, so reading at most PCE_CDDA_TOPUP sectors per call keeps the SD cost
  * small and EVEN, while PCE_CDDA_RING sectors of depth absorb read jitter. */
-#define PCE_CDDA_RING  6                /* FIFO depth in sectors (~5 frames of slack) */
+#define PCE_CDDA_RING  4                /* FIFO depth in sectors (~3 frames of slack; was 6 — trimmed for OGG arena) */
 #define PCE_CDDA_TOPUP 3                /* max sectors read per fill call (> the ~1.25/frame
                                           consumption so it keeps ahead, but bounded = no burst) */
 static uint8_t  s_cdda_sec[PCE_CD_SECTOR_RAW * PCE_CDDA_RING];

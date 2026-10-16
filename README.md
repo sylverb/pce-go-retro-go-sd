@@ -25,7 +25,31 @@ make docker
 ```
 
 Copy `pce.bin` to `/cores/` on the SD card. HuCard ROMs under `/roms/pce/`,
-CD under `/roms/pcecd/<game>/<game>.cue` (+ `.bin` tracks).
+CD under `/roms/pcecd/<game>/<game>.cue` (+ track files).
+
+### PC Engine CD audio tracks
+
+Data tracks stay raw `.bin` (MODE1/2352 or /2048). Audio tracks may be:
+
+| Cue `FILE` type | Format |
+|-----------------|--------|
+| `BINARY` (default) | Red Book PCM, 2352 B/sector |
+| `OGG` | Vorbis, decoded on the fly to Red Book sectors |
+
+Example:
+
+```cue
+FILE "Game (Track 01).bin" BINARY
+  TRACK 01 MODE1/2352
+    INDEX 01 00:00:00
+FILE "Game (Track 02).ogg" OGG
+  TRACK 02 AUDIO
+    INDEX 01 00:00:00
+```
+
+OGG should be **44.1 kHz** (mono or stereo). A decode arena (~168–176 KiB,
+codebook-dependent) is taken from RAM_EMU before CD-RAM is mapped; ADPCM RAM
+lives in DTCM so the bump still covers Super CD’s 256 KiB.
 
 Host CD preview needs the System Card mirrored like the SD layout:
 
