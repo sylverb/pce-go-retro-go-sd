@@ -400,6 +400,21 @@ void lcd_setup_framebuffers(lcd_mode_t mode)
     (void)mode;
 }
 
+void lcd_get_bonus_pool(uint8_t **out_ptr, size_t *out_size)
+{
+    /* Host has no FB bonus; CD-RAM uses the large host RAM bump instead. */
+    if (out_ptr)
+        *out_ptr = NULL;
+    if (out_size)
+        *out_size = 0;
+}
+
+void lcd_set_clut(const uint32_t *clut, uint16_t count)
+{
+    (void)clut;
+    (void)count;
+}
+
 uint32_t lcd_get_last_refresh_rate(void)
 {
     return lcd_refresh_hz;
@@ -766,6 +781,22 @@ uint8_t *odroid_overlay_cache_file_in_flash(const char *file_path, uint32_t *fil
     }
     if (file_size_p)
         *file_size_p = (uint32_t)sz;
+    return buf;
+}
+
+uint8_t *odroid_overlay_cache_file_in_flash_relocate(const char *file_path,
+                                                     uint32_t *file_size_p, bool byte_swap,
+                                                     gw_flash_relocate_cb_t relocate_cb)
+{
+    uint32_t size = 0;
+    uint8_t *buf = odroid_overlay_cache_file_in_flash(file_path, &size, byte_swap);
+
+    if (file_size_p)
+        *file_size_p = size;
+    if (!buf || !size)
+        return NULL;
+    if (relocate_cb)
+        relocate_cb(buf, size, 0, buf, size);
     return buf;
 }
 

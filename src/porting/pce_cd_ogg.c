@@ -1,6 +1,8 @@
 /* PC Engine CD — OGG Vorbis CD-DA via stb_vorbis (streamed, not whole-file). */
 #include "pce_cd_ogg.h"
 
+#ifdef PCE_CD_OGG
+
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -327,3 +329,5 @@ int pce_cd_ogg_read_sectors(const pce_cd_toc_t *toc, uint32_t lba,
 	}
 	return written;
 }
+
+#endif /* PCE_CD_OGG */

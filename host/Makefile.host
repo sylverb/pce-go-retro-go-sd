@@ -81,7 +81,7 @@ host: $(HOST_BIN)
 
 $(HOST_BIN): $(HOST_OBJS)
 	$(V)$(ECHO) [ LD HOST ] $@
-	$(V)$(HOST_CC) -o $@ $(HOST_OBJS) $(HOST_PKG_LIBS)
+	$(V)$(HOST_CC) -o $@ $(HOST_OBJS) $(HOST_PKG_LIBS) $(CORE_LDLIBS)
 
 # Explicit pattern under HOST_BUILD_DIR only (do not collide with sdk ARM rules).
 $(HOST_BUILD_DIR)/src/%.o: src/%.c
@@ -96,7 +96,7 @@ $(HOST_BUILD_DIR)/host/%.o: host/%.c
 
 host_clean:
 	$(V)rm -rf build/host
-	$(V)rm -f $(CORE_NAME)_host ExampleHB_host
+	$(V)rm -f pce_host pcechd_host ExampleHB_host
 
 clean:: host_clean
 

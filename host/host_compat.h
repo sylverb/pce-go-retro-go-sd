@@ -8,6 +8,7 @@
 #include "rom_manager.h"
 #include "gw_malloc.h"
 #include "common.h"
+#include "gw_firmware_abi.h"
 
 #ifdef __cplusplus
 extern "C" {

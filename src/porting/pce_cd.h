@@ -6,6 +6,7 @@
 #pragma once
 
 #include <stdint.h>
+#include <stddef.h>
 #include <stdbool.h>
 
 /* 48 tracks covers real PCE-CD sets (Ys III has 25); keeps TOC BSS smaller so
@@ -32,7 +33,7 @@ typedef enum {
 
 typedef enum {
     PCE_FILE_BINARY = 0,  /* raw 2352/2048 sectors (default) */
-    PCE_FILE_OGG    = 1,  /* Vorbis; decoded to synthetic Red Book sectors */
+    PCE_FILE_OGG    = 1,  /* Vorbis → Red Book sectors (requires PCE_CD_OGG) */
 } pce_cd_file_fmt_t;
 
 typedef struct {
@@ -76,6 +77,12 @@ void pce_cd_close(void);
 /* Drop cached handles without fclose — use after sleep/wake remount when the
  * FatFs volume was torn down and the old FILE* are dangling. */
 void pce_cd_invalidate_handles(void);
+
+/* LUT8 LCD mode frees ~150 KiB AXI bonus for Super CD-RAM (32 banks). Needed
+ * when RAM_EMU is tight (OGG arena, CHD heap). Call once per CD mount. */
+bool pce_cd_enable_lut8_bonus(void);
+bool pce_cd_lut8(void);
+void pce_cd_ram_bonus(uint8_t **ptr, size_t *size);
 
 /* Index of the track containing absolute LBA, or -1. */
 int pce_cd_track_at_lba(const pce_cd_toc_t *toc, uint32_t lba);

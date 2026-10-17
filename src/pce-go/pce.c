@@ -663,7 +663,13 @@ pce_readIO(uint16_t A)
 
     case 0x1A00:                // Arcade Card
 #ifndef PCE_ENABLE_ARCADE_CARD
-        MESSAGE_INFO("Arcade Card not supported : 0x%04X\n", A);
+        {
+            static int s_ac_rd_spam;
+            if (s_ac_rd_spam < 1) {
+                MESSAGE_INFO("Arcade Card not supported (reads silenced)\n");
+                s_ac_rd_spam++;
+            }
+        }
 #endif
         break;
 
@@ -861,7 +867,13 @@ pce_writeIO(uint16_t A, uint8_t V)
 
     case 0x1A00:                /* Arcade Card */
 #ifndef PCE_ENABLE_ARCADE_CARD
-        MESSAGE_INFO("Arcade Card not supported : %d into 0x%04X\n", V, A);
+        {
+            static int s_ac_wr_spam;
+            if (s_ac_wr_spam < 1) {
+                MESSAGE_INFO("Arcade Card not supported (writes silenced)\n");
+                s_ac_wr_spam++;
+            }
+        }
 #endif
         return;
 

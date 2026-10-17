@@ -27,6 +27,7 @@ jobs:
       packed_bin: ${{ steps.meta.outputs.packed_bin }}
       target_elf: ${{ steps.meta.outputs.target_elf }}
       target_map: ${{ steps.meta.outputs.target_map }}
+      xip_bin: ${{ steps.meta.outputs.xip_bin }}
 
     steps:
       - name: Checkout
@@ -44,14 +45,17 @@ jobs:
           PACKED_BIN="$(make --no-print-directory -f Makefile print-PACKED_BIN)"
           TARGET_ELF="$(make --no-print-directory -f Makefile print-TARGET_ELF)"
           TARGET_MAP="$(make --no-print-directory -f Makefile print-TARGET_MAP)"
+          XIP_BIN="$(make --no-print-directory -f Makefile print-XIP_BIN)"
           echo "project_kind=${PROJECT_KIND}" >> "${GITHUB_OUTPUT}"
           echo "packed_bin=${PACKED_BIN}" >> "${GITHUB_OUTPUT}"
           echo "target_elf=${TARGET_ELF}" >> "${GITHUB_OUTPUT}"
           echo "target_map=${TARGET_MAP}" >> "${GITHUB_OUTPUT}"
+          echo "xip_bin=${XIP_BIN}" >> "${GITHUB_OUTPUT}"
           echo "PROJECT_KIND=${PROJECT_KIND}"
           echo "PACKED_BIN=${PACKED_BIN}"
           echo "TARGET_ELF=${TARGET_ELF}"
           echo "TARGET_MAP=${TARGET_MAP}"
+          echo "XIP_BIN=${XIP_BIN}"
 
       - name: Build (Docker)
         run: |
@@ -69,6 +73,7 @@ jobs:
             ${{ steps.meta.outputs.packed_bin }}
             ${{ steps.meta.outputs.target_elf }}
             ${{ steps.meta.outputs.target_map }}
+            ${{ steps.meta.outputs.xip_bin }}
           if-no-files-found: error
 
   release:
@@ -98,11 +103,13 @@ jobs:
           PACKED_BIN="${{ needs.build.outputs.packed_bin }}"
           TARGET_ELF="${{ needs.build.outputs.target_elf }}"
           TARGET_MAP="${{ needs.build.outputs.target_map }}"
+          XIP_BIN="${{ needs.build.outputs.xip_bin }}"
           # Artifact download preserves relative paths under dist/.
           python3 scripts/stage_release.py \
             --bin "dist/${PACKED_BIN}" \
             --elf "dist/${TARGET_ELF}" \
             --map "dist/${TARGET_MAP}" \
+            --sidecar "dist/${XIP_BIN}" \
             --tag "${GITHUB_REF_NAME}" \
             --out release \
             --docker-image "${{ env.DOCKER_IMAGE }}"

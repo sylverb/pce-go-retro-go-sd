@@ -1,5 +1,7 @@
 #include <odroid_system.h>
 #include <string.h>
+#include <stdio.h>
+#include <stdbool.h>
 
 // shared.h includes sms.h which defined CYCLES_PER_LINE.
 // pce.h defines it to the desired value.
@@ -18,18 +20,112 @@
 #include "sound_pce.h"
 #include "pce_cd.h"
 #include "pce_cd_ogg.h"
+#include "pce_cd_chd.h"
 #include "pce_scsi.h"
 #include "pce_adpcm.h"
 #include "appid.h"
+#include "odroid_overlay.h"
 #ifndef GNW_DISABLE_COMPRESSION
 #include "lzma.h"
 #endif
 #include "gw_malloc.h"
 #ifndef HOST_BUILD
+#include "stm32h7xx.h"
 #include "gw_core_bridge.h"
 #else
 #include "host_compat.h"
 #endif
+
+uint8_t *odroid_overlay_cache_file_in_flash_relocate(const char *file_path,
+                                                     uint32_t *file_size_p, bool byte_swap,
+                                                     gw_flash_relocate_cb_t relocate_cb);
+
+#ifndef HOST_BUILD
+/* Linker symbols from ld/pce_core.ld (sentinel patch ranges). */
+extern uint8_t _PCE_MAIN_CODE_END[];
+extern uint8_t _OVERLAY_PCE_BSS_START[];
+extern uint8_t __CORE_ITCM_CODE_START__[];
+extern uint8_t __CORE_ITCM_CODE_END__[];
+#endif
+
+/* -------------------------------------------------------------------- XIP ---
+ * Cold OGG/LZMA-enc text + leftover rodata are linked at sentinel 0xDEC00000,
+ * shipped as /cores/pce.xip, cached into QSPI, then executed/read from there
+ * (same pattern as gba.xip). CHD flac/lzma/zlib stay in RAM_EMU. */
+#define PCE_CODE_BASE  0xDEC00000u
+#define PCE_XIP_PATH   "/cores/pce.xip"
+
+static uint8_t *s_xip_addr;
+static uint32_t s_xip_size;
+static int32_t  s_xip_offset;
+
+static int patch_pce_sentinels(uint32_t *start, uint32_t *end, int32_t offset, uint32_t size)
+{
+    int patched = 0;
+    for (uint32_t *p = start; p < end; p++) {
+        uint32_t v = *p;
+        if ((v & ~1u) >= PCE_CODE_BASE && (v & ~1u) < PCE_CODE_BASE + size) {
+            *p = (uint32_t)(v + offset);
+            patched++;
+        }
+    }
+    return patched;
+}
+
+static void pce_relocate_xip(uint8_t *buffer, uint32_t length, uint32_t offset_in_file,
+                             uint8_t *file_address, uint32_t file_size)
+{
+    (void)offset_in_file;
+    int32_t offset = (int32_t)((uint32_t)file_address - PCE_CODE_BASE);
+    patch_pce_sentinels((uint32_t *)buffer, (uint32_t *)(buffer + (length & ~3u)),
+                        offset, file_size);
+    wdog_refresh();
+}
+
+static bool pce_cache_xip_to_flash(void)
+{
+#ifdef HOST_BUILD
+    s_xip_addr = NULL;
+    s_xip_size = 0;
+    s_xip_offset = 0;
+    printf("host: XIP skipped (cold code linked into binary)\n");
+    return true;
+#else
+    s_xip_size = 0;
+    s_xip_addr = odroid_overlay_cache_file_in_flash_relocate(PCE_XIP_PATH, &s_xip_size, false,
+                                                             &pce_relocate_xip);
+    if (s_xip_addr == NULL || s_xip_size == 0) {
+        printf("pce: %s missing\n", PCE_XIP_PATH);
+        return false;
+    }
+    s_xip_offset = (int32_t)((uint32_t)s_xip_addr - PCE_CODE_BASE);
+    printf("pce: xip @%p %lu KiB offset=0x%08lX\n",
+           s_xip_addr, (unsigned long)(s_xip_size / 1024u),
+           (unsigned long)s_xip_offset);
+
+    int n = patch_pce_sentinels((uint32_t *)_PCE_MAIN_CODE_END,
+                                (uint32_t *)_OVERLAY_PCE_BSS_START,
+                                s_xip_offset, s_xip_size);
+    int n_itcm = patch_pce_sentinels((uint32_t *)__CORE_ITCM_CODE_START__,
+                                     (uint32_t *)__CORE_ITCM_CODE_END__,
+                                     s_xip_offset, s_xip_size);
+    printf("pce: patched %d RAM + %d ITCM sentinel refs\n", n, n_itcm);
+
+    {
+        uint32_t ram_sz = (uint32_t)(_OVERLAY_PCE_BSS_START - _PCE_MAIN_CODE_END);
+        uint32_t itcm_sz = (uint32_t)(__CORE_ITCM_CODE_END__ - __CORE_ITCM_CODE_START__);
+        if (ram_sz > 0) {
+            SCB_CleanDCache_by_Addr((void *)_PCE_MAIN_CODE_END, (int32_t)ram_sz);
+            SCB_InvalidateICache_by_Addr((void *)_PCE_MAIN_CODE_END, (int32_t)ram_sz);
+        }
+        if (itcm_sz > 0)
+            SCB_InvalidateICache_by_Addr((void *)__CORE_ITCM_CODE_START__, (int32_t)itcm_sz);
+        __DSB();
+        __ISB();
+    }
+    return true;
+#endif
+}
 
 /* Base of the RAM_EMU bump window (after core BSS). Device: ram_start.
  * Host: real 64-bit pool pointer (ram_start is only uint32_t). */
@@ -71,7 +167,22 @@ static pce_cd_toc_t s_pcecd_toc;
 
 #define COLOR_RGB(r, g, b) ((((r) << 13) & 0xf800) + (((g) << 8) & 0x07e0) + (((b) << 3) & 0x001f))
 
+/* Match RGB565 mypalette exactly for LUT8 (init_color_pals passes 3/2-bit
+ * components, not 0..63 — scaling those as 6-bit made the CLUT far too dark). */
+static uint32_t rgb565_to_clut888(uint16_t c)
+{
+	uint32_t r = (c >> 11) & 0x1f;
+	uint32_t g = (c >> 5) & 0x3f;
+	uint32_t b = c & 0x1f;
+	r = (r << 3) | (r >> 2);
+	g = (g << 2) | (g >> 4);
+	b = (b << 3) | (b >> 2);
+	return (r << 16) | (g << 8) | b;
+}
+
 static uint16_t mypalette[256];
+static uint32_t s_clut[256];
+static int s_clut_dirty;
 static int current_height = 224, current_width = 256;
 static short audioBuffer_pce[ AUDIO_BUFFER_LENGTH_PCE * 2];
 static uint8_t pce_framebuffer[XBUF_WIDTH * XBUF_HEIGHT];
@@ -190,6 +301,10 @@ void set_color(int index, uint8_t r, uint8_t g, uint8_t b) {
         col = COLOR_RGB(r,g,b);
     }
     mypalette[index] = col;
+    if (index >= 0 && index < 256) {
+        s_clut[index] = rgb565_to_clut888(col);
+        s_clut_dirty = 1;
+    }
 }
 
 void init_color_pals() {
@@ -245,10 +360,20 @@ static void blit();
 uint8_t save_buffer[SAVE_STATE_BUFFER_SIZE];
 #define PCE_SRAM_SIZE 0x800   /* 2KB usable BRAM (bank $F7 low mirror) */
 
+static int pce_ext_is_cd(const char *ext)
+{
+    if (!ext) return 0;
+    if (strcmp(ext, "cue") == 0) return 1;
+#ifdef PCE_CD_CHD
+    if (strcmp(ext, "chd") == 0) return 1;
+#endif
+    return 0;
+}
+
 /* Load per-game BRAM from the standard .sram save file. */
 static void pce_sram_load(void)
 {
-    if (!ACTIVE_FILE || strcmp(ACTIVE_FILE->ext, "cue") != 0) return;
+    if (!ACTIVE_FILE || !pce_ext_is_cd(ACTIVE_FILE->ext)) return;
     pce_bram_init();
     char *path = odroid_system_get_path(ODROID_PATH_SAVE_SRAM, ACTIVE_FILE->path);
     FILE *f = fopen(path, "rb");
@@ -263,7 +388,7 @@ static void pce_sram_load(void)
 /* odroid sram_save callback: exit, sleep, app switch. */
 static void pce_sram_save_cb(void)
 {
-    if (!ACTIVE_FILE || strcmp(ACTIVE_FILE->ext, "cue") != 0) return;
+    if (!ACTIVE_FILE || !pce_ext_is_cd(ACTIVE_FILE->ext)) return;
     char *path = odroid_system_get_path(ODROID_PATH_SAVE_SRAM, ACTIVE_FILE->path);
     FILE *f = fopen(path, "wb");
     if (f) {
@@ -307,7 +432,7 @@ static bool SaveState(const char *savePathName) {
     /* PCE-CD: the 256KB CD RAM (banks 0x68-0x87) holds the game's loaded code +
      * data and is far bigger than save_buffer, so stream it to the file right
      * after the core state. (HuCard .pce saves are unchanged.) */
-    if (written && strcmp(ACTIVE_FILE->ext, "cue") == 0) {
+    if (written && pce_ext_is_cd(ACTIVE_FILE->ext)) {
         for (int v = PCE_CD_RAM_FIRST_BANK; v <= PCE_CD_RAM_LAST_BANK; v++)
             fwrite(PCE.MemoryMapR[v], PCE_CD_RAM_BANK_SIZE, 1, file);
         /* CD-DA stream snapshot (magic + 5 words) so a resume re-arms the BGM. */
@@ -378,7 +503,7 @@ static bool LoadState(const char *savePathName) {
     /* PCE-CD: restore the 256KB CD RAM streamed after the fixed-size core
      * block, then reset the SCSI to idle (the disc stays mounted from launch;
      * saves are taken with no transfer in flight). */
-    if (strcmp(ACTIVE_FILE->ext, "cue") == 0) {
+    if (pce_ext_is_cd(ACTIVE_FILE->ext)) {
         fseek(file, SAVE_STATE_BUFFER_SIZE, SEEK_SET);
         for (int v = PCE_CD_RAM_FIRST_BANK; v <= PCE_CD_RAM_LAST_BANK; v++)
             fread(PCE.MemoryMapW[v], PCE_CD_RAM_BANK_SIZE, 1, file);
@@ -595,7 +720,7 @@ pce_osd_getromdata(unsigned char **data)
 #endif
 #endif
 
-    if (strcmp(ACTIVE_FILE->ext, "cue") == 0) {
+    if (pce_ext_is_cd(ACTIVE_FILE->ext)) {
         /* PCE-CD: the "ROM" is the System Card BIOS (mapped at bank 0); the disc
          * image itself is streamed from SD separately. XIP it from flash like a
          * HuCard. Phase 1 boots the CD-ROM2 menu to validate the core path. */
@@ -606,15 +731,26 @@ pce_osd_getromdata(unsigned char **data)
             if (*data != NULL && bios_size > 0)
                 break;
         }
-        /* Mount the disc so the System Card's SCSI reads ($1800) hit the CUE/BIN. */
-        pce_cd_close();   /* drop any stale cached .bin handle from a prior launch */
+        /* Mount the disc so the System Card's SCSI reads ($1800) hit CUE/BIN/OGG/CHD. */
+        pce_cd_close();   /* drop any stale cached handle from a prior launch */
+        /* LUT8 frees ~150 KiB AXI bonus for Super CD-RAM (32 banks). Must run
+         * before OGG arena / CHD heap claim RAM_EMU — same path for cue+ogg and CHD. */
+        pce_cd_enable_lut8_bonus();
+        bool mounted = false;
+#ifdef PCE_CD_CHD
+        if (ACTIVE_FILE->ext && strcmp(ACTIVE_FILE->ext, "chd") == 0)
+            mounted = pce_cd_chd_open(ACTIVE_FILE->path, &s_pcecd_toc);
+        else
+#endif
         if (pce_cd_parse_cue(ACTIVE_FILE->path, &s_pcecd_toc)) {
             /* Reserve OGG decode arena BEFORE CD-RAM mapping (below) eats the bump. */
             pce_cd_ogg_prepare(&s_pcecd_toc);
-            pce_scsi_set_disc(&s_pcecd_toc, true);
-        } else {
-            pce_scsi_set_disc(NULL, false);
+            mounted = true;
         }
+        if (mounted)
+            pce_scsi_set_disc(&s_pcecd_toc, true);
+        else
+            pce_scsi_set_disc(NULL, false);
         return (*data != NULL && bios_size > 0) ? bios_size : 0;
     }
     uint32_t size = ACTIVE_FILE->size;
@@ -798,37 +934,64 @@ void LoadCartPCE() {
      * this every CD bank aliases the shared 8KB NULLRAM and a loaded game
      * overwrites itself, then traps. Done last so it overrides the System-Card
      * ROM mirror that the bank loop left on 0x68-0x7F. */
-    if (strcmp(ACTIVE_FILE->ext, "cue") == 0) {
+    if (pce_ext_is_cd(ACTIVE_FILE->ext)) {
         int total_banks = PCE_CD_RAM_LAST_BANK - PCE_CD_RAM_FIRST_BANK + 1;  /* 32 = 256KB */
-        int buf_banks   = (int)(ram_get_free_size() / PCE_CD_RAM_BANK_SIZE);
-        if (buf_banks > total_banks) buf_banks = total_banks;
+        int mapped = 0;
+
+        /* LUT8 bonus (~150 KiB) first so Super CD-RAM can be FULL while OGG
+         * arena / CHD codecs keep their RAM_EMU claim. */
+        uint8_t *bonus = NULL;
+        size_t bonus_sz = 0;
+        pce_cd_ram_bonus(&bonus, &bonus_sz);
+        int bonus_banks = (int)(bonus_sz / PCE_CD_RAM_BANK_SIZE);
+        if (bonus_banks > total_banks)
+            bonus_banks = total_banks;
+        if (!bonus)
+            bonus_banks = 0;
+        for (int i = 0; i < bonus_banks; i++) {
+            int v = PCE_CD_RAM_FIRST_BANK + i;
+            uint8_t *p = bonus + (uint32_t)i * PCE_CD_RAM_BANK_SIZE;
+            PCE.MemoryMapR[v] = p;
+            PCE.MemoryMapW[v] = p;
+        }
+        if (bonus_banks > 0)
+            memset(bonus, 0, (uint32_t)bonus_banks * PCE_CD_RAM_BANK_SIZE);
+        mapped = bonus_banks;
+
+        int need = total_banks - mapped;
+        int buf_banks = (int)(ram_get_free_size() / PCE_CD_RAM_BANK_SIZE);
+        if (buf_banks > need)
+            buf_banks = need;
         uint8_t *buf = NULL;
         if (buf_banks > 0)
             buf = (uint8_t *)ram_malloc((size_t)buf_banks * PCE_CD_RAM_BANK_SIZE);
         if (!buf)
             buf_banks = 0;
-        /* If ram_malloc couldn't cover all 32 banks, borrow PCE_EXRAM_BUF
-         * (Populous on-board RAM, idle on CD) then save_buffer. */
-        int exram_banks = (int)(sizeof(PCE_EXRAM_BUF) / PCE_CD_RAM_BANK_SIZE);
-        int from_exram  = total_banks - buf_banks;
-        if (from_exram < 0) from_exram = 0;
-        if (from_exram > exram_banks) from_exram = exram_banks;
-        int mapped = buf_banks + from_exram;
-        if (mapped > total_banks) mapped = total_banks;
-        for (int i = 0; i < mapped; i++) {
-            int v = PCE_CD_RAM_FIRST_BANK + i;
-            uint8_t *p = (i < from_exram)
-                       ? PCE_EXRAM_BUF + (uint32_t)i * PCE_CD_RAM_BANK_SIZE
-                       : buf + (uint32_t)(i - from_exram) * PCE_CD_RAM_BANK_SIZE;
+        for (int i = 0; i < buf_banks; i++) {
+            int v = PCE_CD_RAM_FIRST_BANK + mapped + i;
+            uint8_t *p = buf + (uint32_t)i * PCE_CD_RAM_BANK_SIZE;
             PCE.MemoryMapR[v] = p;
             PCE.MemoryMapW[v] = p;
         }
-        if (from_exram) memset(PCE_EXRAM_BUF, 0, (uint32_t)from_exram * PCE_CD_RAM_BANK_SIZE);
         if (buf_banks > 0)
             memset(buf, 0, (uint32_t)buf_banks * PCE_CD_RAM_BANK_SIZE);
-        /* STILL short of the full 32 banks? Borrow save_buffer (~78KB). Idle
-         * during play; a state Save of a game using those high banks will
-         * clobber them — booting is the priority. */
+        mapped += buf_banks;
+
+        /* Fallback: PCE_EXRAM_BUF then save_buffer if still short. */
+        int exram_banks = (int)(sizeof(PCE_EXRAM_BUF) / PCE_CD_RAM_BANK_SIZE);
+        int from_exram = total_banks - mapped;
+        if (from_exram < 0) from_exram = 0;
+        if (from_exram > exram_banks) from_exram = exram_banks;
+        for (int i = 0; i < from_exram; i++) {
+            int v = PCE_CD_RAM_FIRST_BANK + mapped + i;
+            uint8_t *p = PCE_EXRAM_BUF + (uint32_t)i * PCE_CD_RAM_BANK_SIZE;
+            PCE.MemoryMapR[v] = p;
+            PCE.MemoryMapW[v] = p;
+        }
+        if (from_exram)
+            memset(PCE_EXRAM_BUF, 0, (uint32_t)from_exram * PCE_CD_RAM_BANK_SIZE);
+        mapped += from_exram;
+
         int save_banks_cap = (int)(sizeof(save_buffer) / PCE_CD_RAM_BANK_SIZE);
         int from_save = total_banks - mapped;
         if (from_save < 0) from_save = 0;
@@ -839,10 +1002,13 @@ void LoadCartPCE() {
             PCE.MemoryMapR[v] = p;
             PCE.MemoryMapW[v] = p;
         }
-        if (from_save) memset(save_buffer, 0, (uint32_t)from_save * PCE_CD_RAM_BANK_SIZE);
+        if (from_save)
+            memset(save_buffer, 0, (uint32_t)from_save * PCE_CD_RAM_BANK_SIZE);
         mapped += from_save;
-        printf("CDRAM map: free=%lu buf_banks=%d exram=%d save=%d mapped=%d/%d %s\n",
-                (unsigned long)ram_get_free_size(), buf_banks, from_exram, from_save, mapped, total_banks,
+
+        printf("CDRAM map: free=%lu bonus=%d buf=%d exram=%d save=%d mapped=%d/%d %s\n",
+                (unsigned long)ram_get_free_size(), bonus_banks, buf_banks, from_exram,
+                from_save, mapped, total_banks,
                 (mapped >= total_banks) ? "FULL" : "PARTIAL");
 
         /* BRAM: per-game .sram file (managed by the launcher like any SRAM). */
@@ -874,14 +1040,20 @@ static void blit() {
     odroid_display_scaling_t scaling = odroid_display_get_scaling_mode();
     const int disp_w = current_width;
     const int disp_h = current_height;
+    const int lut8 = pce_cd_lut8();
 
     /* Direct pointer, NOT osd_gfx_framebuffer(): that hook returns NULL on
      * skip frames and blit can be called as the menu repaint callback. */
     uint8_t *emuFrameBuffer = pce_framebuffer + s_fb_offset;
-    pixel_t *framebuffer_active = lcd_get_active_buffer();
+    void *framebuffer_active = lcd_get_active_buffer();
     int y=0, offsetY, offsetX = 0, cropX = 0;
     int xScale = 0;
     uint8_t *fbTmp;
+
+    if (lut8 && s_clut_dirty) {
+        lcd_set_clut(s_clut, 256);
+        s_clut_dirty = 0;
+    }
 
     if (scaling == ODROID_DISPLAY_SCALING_FULL) {
         /* Stretch BOTH axes to fill the screen, like the other cores' FULL mode.
@@ -891,9 +1063,14 @@ static void blit() {
         int yScale = (disp_h << 8) / GW_LCD_HEIGHT;
         for (y = 0; y < GW_LCD_HEIGHT; y++) {
             fbTmp = emuFrameBuffer + ((y * yScale) >> 8) * XBUF_WIDTH;
-            pixel_t *dst = framebuffer_active + y * GW_LCD_WIDTH;
-            for (int x = 0; x < GW_LCD_WIDTH; x++) {
-                dst[x] = mypalette[fbTmp[(x * xScale) >> 8]];
+            if (lut8) {
+                uint8_t *dst = (uint8_t *)framebuffer_active + y * GW_LCD_WIDTH;
+                for (int x = 0; x < GW_LCD_WIDTH; x++)
+                    dst[x] = fbTmp[(x * xScale) >> 8];
+            } else {
+                pixel_t *dst = (pixel_t *)framebuffer_active + y * GW_LCD_WIDTH;
+                for (int x = 0; x < GW_LCD_WIDTH; x++)
+                    dst[x] = mypalette[fbTmp[(x * xScale) >> 8]];
             }
         }
         return;
@@ -917,42 +1094,62 @@ static void blit() {
     int offY = (GW_LCD_HEIGHT - renderHeight) / 2;
     if (offY < 0) offY = 0;
 
-    if (vdc_res_changed) {
-        /* Once per VDC mode change: drop stale pixels after offset/crop shift.
-         * Doing this every frame cost ~150KB memset @ 60fps and spiked CPU. */
-        memset(framebuffer_active, 0,
-               (size_t)GW_LCD_WIDTH * GW_LCD_HEIGHT * sizeof(pixel_t));
-    } else {
-        memset(framebuffer_active, 0,
-               (size_t)offY * GW_LCD_WIDTH * sizeof(pixel_t));
+    {
+        size_t px = lut8 ? 1u : sizeof(pixel_t);
+        if (vdc_res_changed) {
+            /* Once per VDC mode change: drop stale pixels after offset/crop shift.
+             * Doing this every frame cost ~150KB memset @ 60fps and spiked CPU. */
+            memset(framebuffer_active, 0,
+                   (size_t)GW_LCD_WIDTH * GW_LCD_HEIGHT * px);
+        } else {
+            memset(framebuffer_active, 0,
+                   (size_t)offY * GW_LCD_WIDTH * px);
+        }
     }
 
     for(y=0;y<renderHeight;y++) {
         fbTmp = emuFrameBuffer+(y*XBUF_WIDTH);
         offsetY = (y + offY)*GW_LCD_WIDTH;
-        if (xScale) {
-            for(int x=0;x<GW_LCD_WIDTH;x++) {
-                framebuffer_active[offsetY+x]= mypalette[fbTmp[ (x * xScale) >> 8 ]];
+        if (lut8) {
+            uint8_t *dst = (uint8_t *)framebuffer_active;
+            if (xScale) {
+                for(int x=0;x<GW_LCD_WIDTH;x++)
+                    dst[offsetY+x] = fbTmp[(x * xScale) >> 8];
+            } else {
+                memcpy(dst + offsetY + offsetX, fbTmp + cropX, (size_t)renderWidth);
             }
         } else {
-            const int dst0 = offsetY + offsetX;
-            const int src0 = cropX;
-            int x = 0;
-            for (; x + 4 <= renderWidth; x += 4) {
-                framebuffer_active[dst0 + x]     = mypalette[fbTmp[src0 + x]];
-                framebuffer_active[dst0 + x + 1] = mypalette[fbTmp[src0 + x + 1]];
-                framebuffer_active[dst0 + x + 2] = mypalette[fbTmp[src0 + x + 2]];
-                framebuffer_active[dst0 + x + 3] = mypalette[fbTmp[src0 + x + 3]];
+            pixel_t *dst = (pixel_t *)framebuffer_active;
+            if (xScale) {
+                for(int x=0;x<GW_LCD_WIDTH;x++)
+                    dst[offsetY+x]= mypalette[fbTmp[ (x * xScale) >> 8 ]];
+            } else {
+                const int dst0 = offsetY + offsetX;
+                const int src0 = cropX;
+                int x = 0;
+                for (; x + 4 <= renderWidth; x += 4) {
+                    dst[dst0 + x]     = mypalette[fbTmp[src0 + x]];
+                    dst[dst0 + x + 1] = mypalette[fbTmp[src0 + x + 1]];
+                    dst[dst0 + x + 2] = mypalette[fbTmp[src0 + x + 2]];
+                    dst[dst0 + x + 3] = mypalette[fbTmp[src0 + x + 3]];
+                }
+                for (; x < renderWidth; x++)
+                    dst[dst0 + x] = mypalette[fbTmp[src0 + x]];
             }
-            for (; x < renderWidth; x++)
-                framebuffer_active[dst0 + x] = mypalette[fbTmp[src0 + x]];
         }
     }
     if (!vdc_res_changed) {
-        for(y = offY + renderHeight; y < GW_LCD_HEIGHT; y++) {
-            offsetY = y*GW_LCD_WIDTH;
-            for(int x=0;x<GW_LCD_WIDTH;x++)
-                framebuffer_active[offsetY+x]=0;
+        if (lut8) {
+            uint8_t *dst = (uint8_t *)framebuffer_active;
+            for(y = offY + renderHeight; y < GW_LCD_HEIGHT; y++)
+                memset(dst + y * GW_LCD_WIDTH, 0, GW_LCD_WIDTH);
+        } else {
+            pixel_t *dst = (pixel_t *)framebuffer_active;
+            for(y = offY + renderHeight; y < GW_LCD_HEIGHT; y++) {
+                offsetY = y*GW_LCD_WIDTH;
+                for(int x=0;x<GW_LCD_WIDTH;x++)
+                    dst[offsetY+x]=0;
+            }
         }
     }
 }
@@ -1061,7 +1258,7 @@ void pce_pcm_submit() {
 
 static bool is_pce_cd(void)
 {
-    return ACTIVE_FILE && ACTIVE_FILE->ext && strcmp(ACTIVE_FILE->ext, "cue") == 0;
+    return ACTIVE_FILE && ACTIVE_FILE->ext && pce_ext_is_cd(ACTIVE_FILE->ext);
 }
 
 static void apply_cpu_clock(void)
@@ -1110,6 +1307,12 @@ int app_main_pce(uint8_t load_state, uint8_t start_paused, int8_t save_slot) {
 
     // Apply OC if needed
     apply_cpu_clock();
+
+    /* Cache pce.xip before any OGG/cold call (and before heavy init UI). */
+    if (!pce_cache_xip_to_flash()) {
+        printf("pce: abort — copy pce.xip next to pce.bin in /cores/\n");
+        return 0;
+    }
 
     odroid_system_init(APPID_CORE, PCE_SAMPLE_RATE);
     odroid_system_emu_init(&LoadState, &SaveState, &Screenshot, NULL, &sleep_wake_up, &pce_sram_save_cb, NULL);
@@ -1189,7 +1392,7 @@ int app_main_pce(uint8_t load_state, uint8_t start_paused, int8_t save_slot) {
          * after launch, then released. NEVER after a state load: a restored game
          * is past the boot screen, and RUN pauses it (the "resume freezes after
          * 1 second" bug — host-verified at the device log's exact lba 13811). */
-        if (!s_cd_state_loaded && strcmp(ACTIVE_FILE->ext, "cue") == 0) {
+        if (!s_cd_state_loaded && pce_ext_is_cd(ACTIVE_FILE->ext)) {
             static int s_autostart = 0;
             if (s_autostart <= 150) {
                 s_autostart++;

@@ -1,28 +1,30 @@
 # Changelog
 
-## [v0.0.2]
+## [v0.0.3]
 
 ### Added
 
-- SuperGrafx HuCard support (`.sgx`): dual HuC6270 + VPC mix, 32 KiB RAM, VRAM2; hot `spr_buf`/linebufs in DTCM
-- PC Engine CD audio tracks as **OGG Vorbis** (`FILE "track.ogg" OGG` in the cue sheet)
+- PC Engine CD audio tracks as **OGG Vorbis** (`FILE "track.ogg" OGG` in the cue sheet).
+- **CHD** disc images via libchdr (map sidecar on SD, mirrored to QSPI flash at play).
 
 ### Changed
 
-- Nothing
+- Switched to LUT8 display instead of RGB565 to free some additional ram.
 
 ### Fixed
 
-- Nothing
+- Nothing.
 
 ### Install
 
 **Core**
 
-- Copy `pce.bin` to `/cores/` on the SD card.
+- Copy `pce.bin` **and** `pce.xip` to `/cores/` on the SD card.
 - HuCard ROMs: `/roms/pce/*.pce`
-- SuperGrafx: `/roms/sgx/*.sgx` or `*.pce` (CRC auto-detect also works under `/roms/pce/`)
-- CD-ROM²: `/roms/pcecd/<game>/<game>.cue` (+ `.bin` and/or `.ogg` tracks)
+- SuperGrafx: `/roms/sgx/*.sgx` or `*.pce`
+- CD-ROM² cue: `/roms/pcecd/<game>/<game>.cue` (+ `.bin`/`.ogg`)
+- CD-ROM² CHD: `/roms/pcecd/<game>/<game>.chd`
 - System Card (CD): `/bios/pce/syscard3.pce` or `syscard3.bin`
 
-The release archive contains the ready-to-copy SD layout (`cores/pce.bin`).
+The release archive contains the ready-to-copy SD layout
+(`cores/pce.bin` + `cores/pce.xip`).

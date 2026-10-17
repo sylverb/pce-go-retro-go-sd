@@ -1,5 +1,6 @@
 **/build/
 *.bin
+*.xip
 *.elf
 *.map
 *.o
@@ -10,3 +11,4 @@
 host_saves/
 .DS_Store
 __pycache__/
+*.chd

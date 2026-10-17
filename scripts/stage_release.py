@@ -3,13 +3,15 @@
 
 Reads PROJECT_KIND and PACKED_BIN from the root Makefile, builds:
   1. SD install zip:   <stem>-<tag>.zip       → cores|homebrews/<packed.bin>
+                                               (+ optional sidecar e.g. pce.xip)
   2. Debug symbols zip: <stem>-<tag>-debug.zip → ELF, map, README
 
 Extracts release notes from CHANGELOG.md for the requested tag.
 
 Usage:
   python3 scripts/stage_release.py --bin example.bin --tag v1.0.0 --out release \\
-      --elf build/core/example_core.elf --map build/core/example_core.map
+      --elf build/core/example_core.elf --map build/core/example_core.map \\
+      --sidecar pce.xip
 """
 
 from __future__ import annotations
@@ -35,6 +37,7 @@ MAKE_VARS = (
     "DOCKER_IMAGE",
     "TARGET_ELF",
     "TARGET_MAP",
+    "XIP_BIN",
 )
 
 HEADING_RE = re.compile(
@@ -136,9 +139,9 @@ def build_release_notes(
         "---",
         "",
         f"- Project kind: `{project_kind}`",
-        f"- Packed binary: `{packed_name}`",
+        f"- Packed binary: `{packed_name}` (+ `pce.xip` sidecar when present)",
         f"- SD install path: `{install_path}`",
-        f"- Release archive: `{archive_name}` (unzip onto the SD root)",
+        f"- Release archive: `{archive_name}` (unzip onto the SD root; includes `.xip` if any)",
         f"- Debug archive: `{debug_archive_name}` (ELF + linker map)",
         f"- Built with: `{docker_image}`",
         "",
@@ -181,6 +184,7 @@ def stage_release(
     docker_image: str | None,
     elf_path: Path | None,
     map_path: Path | None,
+    sidecar_paths: list[Path] | None = None,
 ) -> None:
     cfg = read_make_vars()
     project_kind = cfg["PROJECT_KIND"]
@@ -215,12 +219,21 @@ def stage_release(
     sd_bin = sd_root / packed_name
     shutil.copy2(bin_path, sd_bin)
 
+    zip_members: list[tuple[Path, str]] = [(sd_bin, f"{sd_dir}/{packed_name}")]
+    for extra in sidecar_paths or []:
+        extra = extra if extra.is_absolute() else ROOT / extra
+        if not extra.is_file():
+            raise SystemExit(f"sidecar not found: {extra}")
+        dest = sd_root / extra.name
+        shutil.copy2(extra, dest)
+        zip_members.append((dest, f"{sd_dir}/{extra.name}"))
+
     stem = Path(packed_name).stem
     tag_slug = slug(tag)
 
     archive_name = f"{stem}-{tag_slug}.zip"
     archive_path = out_dir / archive_name
-    write_zip(archive_path, [(sd_bin, f"{sd_dir}/{packed_name}")])
+    write_zip(archive_path, zip_members)
 
     debug_archive_name = f"{stem}-{tag_slug}-debug.zip"
     debug_archive_path = out_dir / debug_archive_name
@@ -304,6 +317,13 @@ def main() -> None:
         "--docker-image",
         help="builder image string for release notes (default: Makefile DOCKER_IMAGE)",
     )
+    parser.add_argument(
+        "--sidecar",
+        action="append",
+        default=[],
+        type=Path,
+        help="extra file to copy next to the packed .bin on the SD (repeatable; e.g. pce.xip)",
+    )
     args = parser.parse_args()
 
     cfg = read_make_vars()
@@ -315,6 +335,13 @@ def main() -> None:
     if not changelog_path.is_absolute():
         changelog_path = ROOT / changelog_path
 
+    sidecars = list(args.sidecar)
+    sibling_xip = bin_path.with_suffix(".xip")
+    if sibling_xip.is_file() and sibling_xip.resolve() not in {
+        p.resolve() if p.exists() else p for p in sidecars
+    }:
+        sidecars.append(sibling_xip)
+
     stage_release(
         bin_path=bin_path,
         tag=args.tag,
@@ -323,6 +350,7 @@ def main() -> None:
         docker_image=args.docker_image,
         elf_path=args.elf_path,
         map_path=args.map_path,
+        sidecar_paths=sidecars,
     )
 
 
